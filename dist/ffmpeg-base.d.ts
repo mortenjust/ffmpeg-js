@@ -1,0 +1,85 @@
+import * as types from './types';
+export declare class FFmpegBase {
+    private _worker;
+    private _logger;
+    private _source;
+    private _uris?;
+    private _whenReady;
+    private _whenExecutionDone;
+    private _onMessage;
+    private _onProgress;
+    private _memory;
+    private _pendingMessages;
+    private _messageIdCounter;
+    private _currentExecId;
+    /**
+     * Is true when the script has been
+     * loaded successfully
+     */
+    isReady: boolean;
+    constructor({ logger, source }: types.FFmpegBaseSettings);
+    /**
+     * Handles the ffmpeg logs
+     */
+    private handleMessage;
+    private handleScriptLoadError;
+    private createScriptURIs;
+    private generateMessageId;
+    private sendWorkerMessage;
+    private createWorker;
+    /**
+     * Gets called when ffmpeg has been
+     * initiated successfully and is ready
+     * to receive commands
+     */
+    whenReady(cb: types.EventCallback): void;
+    /**
+     * Gets called when ffmpeg is done executing
+     * a script
+     */
+    whenExecutionDone(cb: types.EventCallback): void;
+    /**
+     * Gets called when ffmpeg logs a message
+     */
+    onMessage(cb: types.MessageCallback): void;
+    /**
+     * Remove the callback function from the
+     * message callbacks
+     */
+    removeOnMessage(cb: types.MessageCallback): void;
+    /**
+     * Gets called when a number of frames
+     * has been rendered
+     */
+    onProgress(cb: types.ProgressCallback): void;
+    /**
+     * Remove the callback function from the
+     * progress callbacks
+     */
+    removeOnProgress(cb: types.ProgressCallback): void;
+    /**
+     * Use this message to execute ffmpeg commands
+     */
+    exec(args: string[]): Promise<void>;
+    /**
+     * Terminate the currently running FFmpeg operation
+     */
+    terminate(): Promise<void>;
+    /**
+     * Read a file that is stored in the memfs
+     */
+    readFile(path: string): Promise<Uint8Array>;
+    /**
+     * Delete a file that is stored in the memfs
+     */
+    deleteFile(path: string): Promise<void>;
+    /**
+     * Write a file to the memfs
+     */
+    writeFile(path: string, file: string | Blob): Promise<void>;
+    /**
+     * Call this method to delete all files that
+     * have been written to the memfs memory
+     */
+    clearMemory(): void;
+}

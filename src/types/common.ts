@@ -17,7 +17,7 @@ export type MessageCallback = (msg: string) => void;
  * gets called during rendering when a number
  * of frames has been rendered
  */
-export type ProgressCallback = (progress: number) => void;
+export type ProgressCallback = (progress: number | { progress: number; size?: number; frame?: number }) => void;
 
 /**
  * Defines encoder and decoder records that
@@ -104,9 +104,9 @@ export type WasmModuleURIs = {
    */
   wasm: string;
   /**
-   * `ffmpeg-core.worker.js` path
+   * `ffmpeg-core.worker.js` path (optional for non-threaded builds)
    */
-  worker: string;
+  worker?: string;
 };
 
 /**

@@ -1,10 +1,9 @@
 import { noop, toBlobURL, toUint8Array } from './utils';
 import * as types from './types';
-import * as utils from './utils';
+import { workerScript } from './worker';
 
 export class FFmpegBase {
-  private _module: any;
-  private _ffmpeg: any;
+  private _worker: Worker | null = null;
 
   private _logger = noop;
   private _source: string;
@@ -18,6 +17,9 @@ export class FFmpegBase {
   private _onProgress: Array<types.ProgressCallback> = [];
 
   private _memory: string[] = [];
+  private _pendingMessages: Map<string, { resolve: (value: any) => void; reject: (error: any) => void }> = new Map();
+  private _messageIdCounter = 0;
+  private _currentExecId: string | null = null;
 
   /**
    * Is true when the script has been
@@ -28,72 +30,179 @@ export class FFmpegBase {
   public constructor({ logger, source }: types.FFmpegBaseSettings) {
     this._source = source;
     this._logger = logger;
-    this.createFFmpegScript();
+    this.createWorker();
   }
 
   /**
    * Handles the ffmpeg logs
    */
   private handleMessage(msg: string) {
+    // Use the configured logger
     this._logger(msg);
+
     if (msg.match(/(FFMPEG_END|error)/i)) {
       this._whenExecutionDone.forEach((cb) => cb());
     }
-    if (msg.match(/^frame=/)) {
-      this._onProgress.forEach((cb) => cb(utils.parseProgress(msg)));
-    }
+    // Don't parse frame numbers as progress - we use out_time_ms from logs instead
+    // This ensures consistent progress calculation based on time/duration
     this._onMessage.forEach((cb) => cb(msg));
   }
 
   private handleScriptLoadError() {
-    this._logger('Failed to load script!');
+    this._logger('Failed to load core in worker!');
   }
 
   private async createScriptURIs() {
+    const coreURL = await toBlobURL(this._source);
+    const wasmURL = await toBlobURL(this._source.replace('.js', '.wasm'));
+    
     return {
-      core: await toBlobURL(this._source),
-      wasm: await toBlobURL(this._source.replace('.js', '.wasm')),
-      worker: await toBlobURL(this._source.replace('.js', '.worker.js')),
+      core: coreURL,
+      wasm: wasmURL,
     };
   }
 
-  private handleLocateFile(path: string, prefix: string) {
-    if (path.endsWith('ffmpeg-core.wasm')) {
-      return this._uris?.wasm;
-    }
-    if (path.endsWith('ffmpeg-core.worker.js')) {
-      return this._uris?.worker;
-    }
-    return prefix + path;
+
+  private generateMessageId(): string {
+    return `msg_${Date.now()}_${this._messageIdCounter++}`;
   }
 
-  private async handleScriptLoad() {
-    //@ts-ignore
-    const core: any = await createFFmpegCore({
-      mainScriptUrlOrBlob: this._uris?.core,
-      printErr: this.handleMessage.bind(this),
-      print: this.handleMessage.bind(this),
-      locateFile: this.handleLocateFile.bind(this),
+  private sendWorkerMessage(type: string, payload?: any, messageId?: string, transfer?: Transferable[]): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!this._worker) {
+        reject(new Error('Worker not initialized'));
+        return;
+      }
+
+      const id = messageId || this.generateMessageId();
+      this._pendingMessages.set(id, { resolve, reject });
+
+      if (transfer && transfer.length > 0) {
+        this._worker.postMessage({ id, type, payload }, transfer);
+      } else {
+        this._worker.postMessage({ id, type, payload });
+      }
+
+      // No timeout - let operations run until completion
     });
-
-    this._logger('CREATED FFMPEG WASM:', core);
-    this.isReady = true;
-    this._module = core;
-    this._ffmpeg = this._module.cwrap('proxy_main', 'number', [
-      'number',
-      'number',
-    ]);
-    this._whenReady.forEach((cb) => cb());
   }
 
-  private async createFFmpegScript() {
-    const script = document.createElement('script');
+  private async createWorker() {
     this._uris = await this.createScriptURIs();
-    script.src = this._uris.core;
-    script.type = 'text/javascript';
-    script.addEventListener('load', this.handleScriptLoad.bind(this));
-    script.addEventListener('error', this.handleScriptLoadError.bind(this));
-    document.head.appendChild(script);
+
+    // Create worker from blob URL
+    const blob = new Blob([workerScript], { type: 'application/javascript' });
+    const workerURL = URL.createObjectURL(blob);
+    this._worker = new Worker(workerURL);
+
+    // Handle worker messages
+    this._worker.onmessage = (event: MessageEvent) => {
+      const { id, type, success, payload, error } = event.data;
+
+      // Handle log messages
+      if (type === 'log' && payload) {
+        this.handleMessage(payload.message);
+        return;
+      }
+
+      // Handle progress messages
+      if (type === 'progress' && payload !== undefined && payload !== null) {
+        // Progress object can have different structures in 0.12
+        // It might be { progress: number, time: number } or just a number
+        let progressValue: number | { time: number } | null = null;
+        
+        // Helper to validate progress values - reject obviously invalid values
+        const isValidProgress = (value: number): boolean => {
+          if (!isFinite(value)) return false;
+          // If it's a percentage (0-1), it should be in that range
+          if (value >= 0 && value <= 1) return true;
+          // If it's a frame number, it should be reasonable (not billions)
+          // Frame numbers typically don't exceed 10 million for reasonable videos
+          if (value > 0 && value < 10000000) return true;
+          return false;
+        };
+        
+        if (typeof payload === 'number') {
+          if (isValidProgress(payload)) {
+            progressValue = payload;
+          }
+        } else if (payload && typeof payload.progress === 'number') {
+          if (isValidProgress(payload.progress)) {
+            // Progress object with optional size
+            progressValue = payload;
+          }
+        } else if (payload && typeof payload.time === 'number') {
+          // Validate time value - should be reasonable (not MAX_SAFE_INTEGER or negative huge values)
+          if (isFinite(payload.time) && payload.time >= 0 && payload.time < 86400 * 365) {
+            progressValue = payload;
+          }
+        }
+        
+        if (progressValue !== null) {
+          // Pass the full progress value (number or object) to callbacks
+          // Debug: log progress forwarding
+          console.log('FFmpeg progress:', progressValue, 'callbacks:', this._onProgress.length);
+          this._onProgress.forEach((cb) => cb(progressValue as any));
+        } else {
+          // Debug: log why progress was rejected
+          console.log('FFmpeg progress rejected:', { payload, type: typeof payload });
+        }
+        return;
+      }
+
+      // Mark execution done when worker reports exec completion or termination
+      if (type === 'exec' || type === 'terminate') {
+        this._whenExecutionDone.forEach((cb) => cb());
+      }
+
+      // Handle response messages
+      if (id && this._pendingMessages.has(id)) {
+        const { resolve, reject } = this._pendingMessages.get(id)!;
+        this._pendingMessages.delete(id);
+        
+        if (success) {
+          resolve(payload);
+        } else {
+          // Ensure we always throw an error when success is false
+          const errorMessage = error || 'Unknown error occurred';
+          reject(new Error(errorMessage));
+        }
+      } else if (!success && error) {
+        // If we get an error message without a matching pending message,
+        // log it as it might indicate a serious issue
+        this._logger(`Unhandled worker error: ${error}`);
+      }
+    };
+
+    this._worker.onerror = (error) => {
+      this._logger('Worker error:', error);
+      this.handleMessage(`Worker error: ${error.message}`);
+      
+      // Reject all pending messages when worker crashes
+      const errorMessage = error.message || 'Worker error occurred';
+      for (const [id, { reject }] of this._pendingMessages.entries()) {
+        this._pendingMessages.delete(id);
+        reject(new Error(`Worker error: ${errorMessage}`));
+      }
+    };
+
+    // Load the core in the worker
+    if (!this._uris) {
+      throw new Error('URIs not initialized');
+    }
+    
+    try {
+      await this.sendWorkerMessage('load', {
+        coreURL: this._uris.core,
+        wasmURL: this._uris.wasm,
+      });
+      
+      this.isReady = true;
+      this._whenReady.forEach((cb) => cb());
+    } catch (error) {
+      this._logger('Failed to load core in worker:', error);
+      this.handleScriptLoadError();
+    }
   }
 
   /**
@@ -149,72 +258,112 @@ export class FFmpegBase {
    * Use this message to execute ffmpeg commands
    */
   public async exec(args: string[]): Promise<void> {
-    this._ffmpeg(...this.parseArgs(['./ffmpeg', '-nostdin', '-y', ...args]));
+    if (!this.isReady) {
+      throw new Error('FFmpeg is not ready yet. Wait for whenReady() callback.');
+    }
 
-    await new Promise<void>((resolve) => {
-      this.whenExecutionDone(resolve);
-    });
+    // Execute via worker
+    try {
+      const execId = this.generateMessageId();
+      this._currentExecId = execId;
+      
+      // Wait for worker to complete execution - the promise resolves when worker sends response
+      await this.sendWorkerMessage('exec', { args, id: execId }, execId);
 
-    // add file that has been created to memory
-    if (args.at(-1)?.match(/\S\.[A-Za-z0-9_-]{1,20}/)) {
-      this._memory.push(args.at(-1) ?? '');
+      // Clear current exec ID if it matches
+      if (this._currentExecId === execId) {
+        this._currentExecId = null;
+      }
+
+      // add file that has been created to memory
+      if (args.at(-1)?.match(/\S\.[A-Za-z0-9_-]{1,20}/)) {
+        this._memory.push(args.at(-1) ?? '');
+      }
+    } catch (error: any) {
+      // Clear current exec ID on error
+      this._currentExecId = null;
+      throw error;
     }
   }
 
   /**
-   * This method allocates memory required
-   * to execute the command
+   * Terminate the currently running FFmpeg operation
    */
-  private parseArgs(args: string[]) {
-    const argsPtr = this._module._malloc(
-      args.length * Uint32Array.BYTES_PER_ELEMENT
-    );
+  public async terminate(): Promise<void> {
+    if (!this.isReady) {
+      throw new Error('FFmpeg is not ready yet. Wait for whenReady() callback.');
+    }
 
-    args.forEach((s, idx) => {
-      const sz = this._module.lengthBytesUTF8(s) + 1;
-      const buf = this._module._malloc(sz);
-      this._module.stringToUTF8(s, buf, sz);
-      this._module.setValue(
-        argsPtr + Uint32Array.BYTES_PER_ELEMENT * idx,
-        buf,
-        'i32'
-      );
-    });
-    return [args.length, argsPtr];
+    if (!this._currentExecId) {
+      // No operation currently running
+      return;
+    }
+
+    const execId = this._currentExecId;
+    
+    // Reject the pending exec promise if it exists
+    if (this._pendingMessages.has(execId)) {
+      const { reject } = this._pendingMessages.get(execId)!;
+      this._pendingMessages.delete(execId);
+      reject(new Error('FFmpeg execution was terminated'));
+    }
+
+    try {
+      await this.sendWorkerMessage('terminate', { execId });
+      this._currentExecId = null;
+    } catch (error: any) {
+      // Even if terminate fails, clear the exec ID
+      this._currentExecId = null;
+      throw error;
+    }
   }
 
   /**
    * Read a file that is stored in the memfs
    */
-  public readFile(path: string): Uint8Array {
-    this._logger('READING FILE:', path);
-    return this._module.FS.readFile(path);
+  public async readFile(path: string): Promise<Uint8Array> {
+    try {
+      const result = await this.sendWorkerMessage('readFile', { path });
+      if (!result || !result.data) {
+        throw new Error(`Failed to read file: ${path} - no data returned`);
+      }
+      return new Uint8Array(result.data);
+    } catch (error: any) {
+      // Re-throw with more context if needed
+      if (error.message && !error.message.includes(path)) {
+        throw new Error(`Failed to read file ${path}: ${error.message}`);
+      }
+      throw error;
+    }
   }
 
   /**
    * Delete a file that is stored in the memfs
    */
-  public deleteFile(path: string): void {
+  public async deleteFile(path: string): Promise<void> {
     try {
-      this._logger('DELETING FILE:', path);
-      this._module.FS.unlink(path);
+      await this.sendWorkerMessage('deleteFile', { path });
     } catch (e) {
-      this._logger('Could not delete file');
+      // Silently fail if file doesn't exist
     }
   }
 
   /**
-   * Write a file to the memfs, the first argument
-   * is the file name to use. The second argument
-   * needs to contain an url to the file or the file
-   * as a blob
+   * Write a file to the memfs
    */
   public async writeFile(path: string, file: string | Blob): Promise<void> {
-    const data: Uint8Array = await toUint8Array(file);
-
-    this._logger('WRITING FILE:', path);
-    this._module.FS.writeFile(path, data);
-    this._memory.push(path);
+    try {
+      const data: Uint8Array = await toUint8Array(file);
+      // Send ArrayBuffer directly instead of converting to array to avoid "Invalid array length" errors with large files
+      await this.sendWorkerMessage('writeFile', { path, data: data.buffer }, undefined, [data.buffer]);
+      this._memory.push(path);
+    } catch (error: any) {
+      // Re-throw with more context if needed
+      if (error.message && !error.message.includes(path)) {
+        throw new Error(`Failed to write file ${path}: ${error.message}`);
+      }
+      throw error;
+    }
   }
 
   /**

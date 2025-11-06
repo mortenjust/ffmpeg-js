@@ -9,7 +9,7 @@ export class FFmpeg<
     string,
     string,
     string
-  > = types.FFmpegConfiguration
+  > = types.FFmpegConfiguration,
 > extends FFmpegBase {
   private _inputs: types.InputOptions[] = [];
   private _output?: types.OutputOptions<Config>;
@@ -71,7 +71,7 @@ export class FFmpeg<
       msg = msg.trim();
       let keys: [
         keyof types.SupportedCodecs,
-        keyof types.EncoderDecoderRecords
+        keyof types.EncoderDecoderRecords,
       ][] = [];
 
       if (!msg.match(/[DEVASIL\.]{6}\W(?!=)/)) return;
@@ -168,7 +168,7 @@ export class FFmpeg<
     this._middleware.push('-af', filter);
     if (this._inputs.length > 1) {
       throw new Error(
-        'Cannot use filters on multiple outputs, please use filterComplex instead'
+        'Cannot use filters on multiple outputs, please use filterComplex instead',
       );
     }
     return this;
@@ -182,7 +182,7 @@ export class FFmpeg<
     this._middleware.push('-vf', filter);
     if (this._inputs.length > 1) {
       throw new Error(
-        'Cannot use filters on multiple outputs, please use filterComplex instead'
+        'Cannot use filters on multiple outputs, please use filterComplex instead',
       );
     }
     return this;
@@ -207,6 +207,15 @@ export class FFmpeg<
   }
 
   /**
+   * Append additional ffmpeg arguments that are not covered by
+   * the convenience methods.
+   */
+  public otherArgs(args: string[]): this {
+    this._middleware.push(...args);
+    return this;
+  }
+
+  /**
    * Get the ffmpeg command from the specified
    * inputs and outputs.
    */
@@ -224,7 +233,7 @@ export class FFmpeg<
   public async export(): Promise<Uint8Array | undefined> {
     const cmd = await this.command();
     await this.exec(cmd);
-    const file = this.readFile(cmd.at(-1) ?? '');
+    const file = await this.readFile(cmd.at(-1) ?? '');
     this.clearMemory();
     return file;
   }
@@ -240,14 +249,14 @@ export class FFmpeg<
     };
     const callback = parseMetadata(meta);
     this.onMessage(callback);
-    await this.exec(['-i', 'probe']);
+    await this.exec(['-i', 'probe', '-f', 'null', '-']);
     this.removeOnMessage(callback);
     this.clearMemory();
     return meta;
   }
 
   /**
-   * Generate a series of thumbnails 
+   * Generate a series of thumbnails
    * @param source Your input file
    * @param count The number of thumbnails to generate
    * @param start Lower time limit in seconds
@@ -255,7 +264,7 @@ export class FFmpeg<
    * @example
    * // type AsyncGenerator<Blob, void, void>
    * const generator = ffmpeg.thumbnails('/samples/video.mp4');
-   * 
+   *
    * for await (const image of generator) {
    *    const img = document.createElement('img');
    *    img.src = URL.createObjectURL(image);
@@ -266,7 +275,7 @@ export class FFmpeg<
     source: string | Blob,
     count: number = 5,
     start: number = 0,
-    stop?: number
+    stop?: number,
   ): AsyncGenerator<Blob, void, void> {
     // make sure start and stop are defined
     if (!stop) {
@@ -276,7 +285,7 @@ export class FFmpeg<
       if (duration) stop = duration;
       else {
         console.warn(
-          'Could not extract duration from meta data please provide a stop argument. Falling back to 1sec otherwise.'
+          'Could not extract duration from meta data please provide a stop argument. Falling back to 1sec otherwise.',
         );
         stop = 1;
       }
@@ -299,8 +308,11 @@ export class FFmpeg<
       ]);
       try {
         const res = await this.readFile('image.jpg');
-        yield new Blob([res], { type: 'image/jpeg' });
-      } catch (e) { }
+        // Create a new ArrayBuffer to avoid SharedArrayBuffer type issues
+        const buffer = new ArrayBuffer(res.length);
+        new Uint8Array(buffer).set(res);
+        yield new Blob([buffer], { type: 'image/jpeg' });
+      } catch (e) {}
     }
     this.clearMemory();
   }
@@ -333,7 +345,7 @@ export class FFmpeg<
   }
 
   private parseAudioOutput(
-    audio: types.OutputOptions<Config>['audio']
+    audio: types.OutputOptions<Config>['audio'],
   ): string[] {
     if (!audio) return [];
     if ('disableAudio' in audio) {
@@ -360,7 +372,7 @@ export class FFmpeg<
   }
 
   private parseVideoOutput(
-    video: types.OutputOptions<Config>['video']
+    video: types.OutputOptions<Config>['video'],
   ): string[] {
     if (!video) return [];
     if ('disableVideo' in video) {
